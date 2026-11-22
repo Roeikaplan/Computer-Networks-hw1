@@ -13,13 +13,13 @@ import struct
 from enum import Enum
 from typing import Callable, List, Optional, Tuple, Union
 
-# ------------------------------ Protocol constants (see PROTOCOL.md) ------------------------------
-HEADER = struct.Struct("!I")      # 4-byte big-endian length before every JSON body
-MAX_REQUEST = 64 * 1024           # the server closes the connection on a bigger request
-MAX_REPLY = 1024 * 1024           # we refuse a bigger reply (the server never sends one)
-RECV_SIZE = 64 * 1024             # most bytes asked from one recv() call
-CONNECT_TIMEOUT = 5.0             # seconds to wait for the TCP handshake
-REPLY_TIMEOUT = 10.0              # seconds to wait for a reply before giving up
+# see PROTOCOL.md
+HEADER = struct.Struct("!I")      # 4-byte big-endian body length
+MAX_REQUEST = 64 * 1024           # server drops the connection above this
+MAX_REPLY = 1024 * 1024
+RECV_SIZE = 64 * 1024
+CONNECT_TIMEOUT = 5.0
+REPLY_TIMEOUT = 10.0
 
 
 class TxType(Enum):
@@ -48,24 +48,17 @@ class RequestFailed(Exception):
     """The server rejected the request. ``str(self)`` is safe to show to the user."""
 
 
-# ------------------------------ reply checking ------------------------------
 def _field(obj: dict, key: str, kind: type, optional: bool = False):
-    """Return ``obj[key]`` if it has the expected JSON type, else raise ``ProtocolError``.
-
-    ``kind`` is ``str`` or ``int``. The check is ``type(x) is kind``, so JSON
-    ``true``/``false`` (bools are ints in Python) do not pass as numbers.
-    ``optional=True`` also accepts ``null`` and returns ``None``.
-    """
+    """Get obj[key] and check its type. optional=True also allows null."""
     value = obj.get(key)
     if value is None and optional:
         return None
-    if type(value) is not kind:
+    if type(value) is not kind:         # exact type, so true/false don't count as ints
         raise ProtocolError(f"Reply field '{key}' is missing or has the wrong type")
     return value
 
 
 def _items(reply: dict, key: str) -> List[dict]:
-    """Return ``reply[key]`` if it is a list of JSON objects, else raise ``ProtocolError``."""
     items = reply.get(key)
     if type(items) is not list or not all(type(item) is dict for item in items):
         raise ProtocolError(f"Reply field '{key}' is not a list of objects")
@@ -80,7 +73,7 @@ class Connection:
     """
 
     def __init__(self):
-        self._sock: Optional[socket.socket] = None   # None while not connected
+        self._sock: Optional[socket.socket] = None
 
     @property
     def connected(self) -> bool:
@@ -101,13 +94,13 @@ class Connection:
         Raises:
             OSError / ConnectionError: if the server cannot be reached.
         """
-        self.close()                                   # never leak an older socket
+        self.close()
         try:
             sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
         except socket.timeout as err:
             raise ConnectionError(
                 f"No answer from {host}:{port} within {CONNECT_TIMEOUT:g} seconds") from err
-        sock.settimeout(REPLY_TIMEOUT)                 # from now on: the limit for each recv/send
+        sock.settimeout(REPLY_TIMEOUT)
         self._sock = sock
 
     def close(self) -> None:
@@ -116,36 +109,30 @@ class Connection:
         Returns:
             None.
         """
-        sock, self._sock = self._sock, None            # mark closed first, even if close() fails
+        sock, self._sock = self._sock, None
         if sock is not None:
             try:
-                sock.close()                           # sends FIN; the server drops our session
+                sock.close()
             except OSError:
                 pass
 
-    # ------------------------------ transport helpers ------------------------------
     def _request(self, op: str, **fields) -> dict:
-        """Send one request and return the server's reply when ``ok`` is true.
-
-        Raises:
-            RequestFailed: the server answered ``{"ok": false, "error": ...}``.
-            ProtocolError: the reply could not be understood.
-            ConnectionError / OSError: not connected, connection lost, or no reply in time.
-        """
+        """Send a request and wait for the reply. Raises RequestFailed if ok is false."""
         if self._sock is None:
             raise ConnectionError("Not connected to the server")
         body = json.dumps({"op": op, **fields}, separators=(",", ":")).encode("utf-8")
-        if len(body) > MAX_REQUEST:                    # nothing sent yet, so the stream is fine
+        if len(body) > MAX_REQUEST:
             raise RequestFailed("Request too large")
         try:
-            self._send_all(HEADER.pack(len(body)) + body)       # header + body in one write
+            self._send_all(HEADER.pack(len(body)) + body)
             reply = self._recv_reply()
         except socket.timeout as err:
-            # A late reply would be read as the answer to our NEXT request: drop the connection.
+            # if the reply shows up later we'd take it as the answer to the next
+            # request, so the connection is useless now
             self.close()
             raise ConnectionError(f"No reply from the server within {REPLY_TIMEOUT:g} seconds") from err
         except BaseException:
-            # Lost connection, bad reply, even Ctrl+C mid-read: the stream is out of sync.
+            # anything else mid-request also leaves the stream out of sync
             self.close()
             raise
 
@@ -160,34 +147,32 @@ class Connection:
         raise ProtocolError("Reply has no valid 'ok' field")
 
     def _send_all(self, data: bytes) -> None:
-        """Send every byte of ``data``: ``send()`` may take only part of it."""
-        view = memoryview(data)                        # slicing a memoryview copies nothing
+        # like sendall(), written out so a short send is handled explicitly
+        view = memoryview(data)
         while view:
-            sent = self._sock.send(view)               # blocks at most REPLY_TIMEOUT seconds
+            sent = self._sock.send(view)
             if sent == 0:
                 raise ConnectionError("The connection was closed while sending")
-            view = view[sent:]                         # keep only what is still unsent
+            view = view[sent:]
 
     def _recv_reply(self) -> dict:
-        """Read one whole frame and decode its JSON object."""
         (length,) = HEADER.unpack(self._recv_exact(HEADER.size))
         if not 1 <= length <= MAX_REPLY:
             raise ProtocolError(f"Bad reply length: {length}")
         body = self._recv_exact(length)
         try:
             reply = json.loads(body.decode("utf-8"))
-        except (ValueError, RecursionError) as err:   # bad UTF-8 / bad JSON / absurd nesting
+        except (ValueError, RecursionError) as err:
             raise ProtocolError("Reply is not valid JSON") from err
         if not isinstance(reply, dict):
             raise ProtocolError("Reply is not a JSON object")
         return reply
 
     def _recv_exact(self, n: int) -> bytes:
-        """Receive exactly ``n`` bytes. TCP may deliver them in any number of pieces."""
         data = bytearray()
         while len(data) < n:
             chunk = self._sock.recv(min(n - len(data), RECV_SIZE))
-            if not chunk:                              # b"" = the server closed the connection
+            if not chunk:
                 raise ConnectionError("The server closed the connection")
             data += chunk
         return bytes(data)
@@ -233,13 +218,13 @@ class Connection:
             None.
         """
         if not self.connected:
-            return                                     # nothing to log out of
+            return
         try:
             self._request("logout")
         except RequestFailed:
-            pass                                       # e.g. "Not logged in": already logged out
+            pass                    # already logged out
         finally:
-            self.close()                               # always, even if the request failed
+            self.close()
 
     def req_get_balance(self) -> str:
         """Fetch the logged-in account's balance.
@@ -345,7 +330,7 @@ class Connection:
                  _field(o, "target_name", str),
                  _field(o, "amount", str),
                  _field(o, "executed", int),
-                 _field(o, "remaining", int, optional=True),   # null = until cancelled
+                 _field(o, "remaining", int, optional=True),
                  _field(o, "next_run", str))
                 for o in orders]
 
@@ -362,7 +347,7 @@ class Connection:
             RequestFailed: unknown standing order or not owned by this account.
             ConnectionError: connection lost.
         """
-        # The GUI passes the id as text from its table; the protocol wants a JSON int.
+        # the GUI passes it as a string
         if type(so_id) is str and so_id.isascii() and so_id.isdigit():
             so_id = int(so_id)
         if type(so_id) is not int:
@@ -438,12 +423,12 @@ class Connection:
             RequestFailed: not logged in or bad timestamps.
             ConnectionError: connection lost.
         """
-        reply = self._request("history", from_ts=from_ts, to_ts=to_ts)   # None -> null = no bound
+        reply = self._request("history", from_ts=from_ts, to_ts=to_ts)
         history = []
         for e in _items(reply, "entries"):
             raw_type = _field(e, "type", str)
             try:
-                tx_type = TxType(raw_type)                 # "DEPOSIT" -> TxType.DEPOSIT
+                tx_type = TxType(raw_type)
             except ValueError as err:
                 raise ProtocolError(f"Unknown history entry type: {raw_type!r}") from err
             history.append((_field(e, "time", str),
@@ -453,4 +438,4 @@ class Connection:
                             _field(e, "amount", str),
                             _field(e, "balance", str),
                             _field(e, "note", str)))
-        return history                                     # oldest first, as the server sends it
+        return history

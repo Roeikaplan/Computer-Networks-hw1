@@ -23,29 +23,30 @@ from server_utils import SimTime
 
 log = logging.getLogger("bank")
 
-# ----------------------------- constants ------------------------------
 CENT = Decimal("0.01")
-MAX_AMOUNT = Decimal("10000000.00")          # upper limit for a single amount
+MAX_AMOUNT = Decimal("10000000.00")
 
 TOKEN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 TOKEN_LENGTH = 10
 
+# [0-9] instead of \d, since \d also matches non-ASCII digits
 NAME_RE = re.compile(r"[A-Za-z0-9_]{3,20}")
-AMOUNT_RE = re.compile(r"[0-9]+(\.[0-9]{1,2})?")   # [0-9], not \d: \d also matches non-ASCII digits
-COUNT_RE = re.compile(r"[0-9]{1,4}")               # standing order payment count, "0" = until cancelled
+AMOUNT_RE = re.compile(r"[0-9]+(\.[0-9]{1,2})?")
+COUNT_RE = re.compile(r"[0-9]{1,4}")
 MIN_PASSWORD_LEN = 4
 
-LOAN_DAYS = 30                       # a loan is repaid automatically this many bank days later
-LOAN_FEE = Decimal("1.05")           # repay = principal * 1.05
-OVERDRAFT_RATE = Decimal("0.0005")   # 0.05% of a negative balance, charged daily
-MAX_DAYS_PER_COMMAND = 366           # most days one console command may advance
+LOAN_DAYS = 30
+LOAN_FEE = Decimal("1.05")
+OVERDRAFT_RATE = Decimal("0.0005")   # per day
+MAX_DAYS_PER_COMMAND = 366
 
-PBKDF2_ITERATIONS = 50_000   # keeps one login well under 0.1 s, so the select() loop isn't stalled
+# low enough that a login doesn't stall the select() loop
+PBKDF2_ITERATIONS = 50_000
 
-CASH = "CASH"                # counterparty for deposits and withdrawals
-BANK = "BANK"                # counterparty for loans, repayments and interest
+CASH = "CASH"
+BANK = "BANK"
 
-# History entry types (same strings as TxType in client/connection.py)
+# history entry types, must match TxType in client/connection.py
 DEPOSIT = "DEPOSIT"
 WITHDRAWAL = "WITHDRAWAL"
 TRANSFER_IN = "TRANSFER_IN"
@@ -57,21 +58,15 @@ OVERDRAFT_INTEREST = "OVERDRAFT_INTEREST"
 
 
 class BankError(Exception):
-    """A request broke a bank rule. ``str(self)`` is shown to the user."""
+    """Request rejected by the bank. The message is sent to the client."""
 
 
-# ------------------------------ helpers -------------------------------
 def money(value: Decimal) -> str:
-    """Format a Decimal as a two-decimal string, e.g. ``"-12.50"``."""
     return str(value.quantize(CENT, rounding=ROUND_HALF_UP))
 
 
 def parse_amount(text) -> Decimal:
-    """Validate a positive amount string from a client and return it as a Decimal.
-
-    Accepts "100", "99.9", "99.90". Rejects "0", "-5", "1e3", "abc", "1.234",
-    non-strings, and anything above MAX_AMOUNT.
-    """
+    """Parse a positive amount like "100" or "99.90" (max 2 decimals)."""
     if not isinstance(text, str) or not AMOUNT_RE.fullmatch(text):
         raise BankError("Invalid amount")
     value = Decimal(text).quantize(CENT)
@@ -85,25 +80,20 @@ def hash_password(password: str, salt: bytes) -> bytes:
 
 
 def next_month(d: date, day: int) -> date:
-    """The date one month after ``d``, on day ``day`` of that month.
-
-    If the month is too short, use its last day:
-    next_month(2026-01-31, 31) -> 2026-02-28, then next_month(2026-02-28, 31) -> 2026-03-31.
-    """
+    """Same day next month, or the last day of the month if it's shorter."""
     year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
     last_day = calendar.monthrange(year, month)[1]
     return date(year, month, min(day, last_day))
 
 
-# ------------------------------- data ---------------------------------
 @dataclass
 class HistoryEntry:
-    ts: float              # simulated Unix time, used for the history filter
-    time: str              # the same moment as "YYYY-MM-DD HH:MM:SS"
-    type: str              # one of the history entry types above
-    party: str             # other account's token, CASH or BANK
+    ts: float
+    time: str
+    type: str
+    party: str             # token, CASH or BANK
     party_name: str
-    amount: Decimal        # signed: + money in, - money out
+    amount: Decimal        # negative = money out
     balance: Decimal       # balance after this entry
     note: str = ""
 
@@ -126,13 +116,13 @@ class Account:
 @dataclass
 class StandingOrder:
     so_id: int
-    payer: str             # token of the account that pays
-    payee: str             # token of the account that receives
-    amount: Decimal        # per payment
-    total: int             # number of payments, 0 = until cancelled
-    day: int               # day of month it was created on; later payments keep it
-    next_run: date         # date of the next payment
-    executed: int = 0      # payments made so far
+    payer: str
+    payee: str
+    amount: Decimal
+    total: int             # 0 = until cancelled
+    day: int               # day of month to pay on
+    next_run: date
+    executed: int = 0
 
     def remaining(self) -> Optional[int]:
         return None if self.total == 0 else self.total - self.executed
@@ -141,28 +131,24 @@ class StandingOrder:
 @dataclass
 class Loan:
     loan_id: int
-    token: str             # borrower
+    token: str
     principal: Decimal
-    repay: Decimal         # principal * 1.05
+    repay: Decimal
     taken_on: date
-    due_on: date           # taken_on + 30 days
+    due_on: date
 
 
-# ------------------------------- bank ---------------------------------
 class Bank:
     def __init__(self, start_date: date):
         self.clock = SimTime(start_date=start_date)
         self.accounts: Dict[str, Account] = {}
-        self.standing_orders: Dict[int, StandingOrder] = {}   # active orders only
-        self.loans: Dict[int, Loan] = {}                      # unpaid loans only
+        self.standing_orders: Dict[int, StandingOrder] = {}   # active only
+        self.loans: Dict[int, Loan] = {}                      # unpaid only
         self._next_so_id = 1
         self._next_loan_id = 1
-        # Last bank date whose day-start work (payments) is done. run_due() catches up from here.
-        self._processed = self.clock.today()
+        self._processed = self.clock.today()   # last day run_due() has handled
 
-    # ---------- internal ----------
     def _account(self, token: str) -> Account:
-        """The account for ``token``, or BankError if there is none."""
         acct = self.accounts.get(token) if isinstance(token, str) else None
         if acct is None:
             raise BankError("Unknown user id")
@@ -176,11 +162,7 @@ class Bank:
 
     def _apply(self, acct: Account, delta: Decimal, tx_type: str,
                party: str, party_name: str, note: str = "") -> None:
-        """Change a balance and record it in the history.
-
-        Every balance change in the bank goes through here, so the history
-        always matches the balance.
-        """
+        # all balance changes go through here so history always matches the balance
         acct.balance += delta
         now = self.clock.now()
         acct.history.append(HistoryEntry(
@@ -188,9 +170,9 @@ class Bank:
             party=party, party_name=party_name, amount=delta,
             balance=acct.balance, note=note))
 
-    # ---------- accounts ----------
+    # accounts
+
     def register(self, name, password) -> str:
-        """Create an account and return its new token. Does not log in."""
         if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             raise BankError("Invalid user name (3-20 letters, digits or _)")
         if not isinstance(password, str) or len(password) < MIN_PASSWORD_LEN:
@@ -203,15 +185,15 @@ class Bank:
         return token
 
     def login(self, token, password) -> str:
-        """Check the credentials and return the account name."""
         acct = self.accounts.get(token) if isinstance(token, str) else None
         if acct is None or not isinstance(password, str) or \
                 not hmac.compare_digest(hash_password(password, acct.salt), acct.pw_hash):
-            # Same message for both cases, so the reply doesn't reveal which tokens exist.
+            # same error either way, so you can't probe for valid tokens
             raise BankError("Wrong user id or password")
         return acct.name
 
-    # ---------- money ----------
+    # money
+
     def balance(self, token: str) -> str:
         return money(self._account(token).balance)
 
@@ -222,14 +204,13 @@ class Bank:
         return money(acct.balance)
 
     def withdraw(self, token: str, amount) -> str:
-        """Withdraw cash. The balance may go negative (overdraft)."""
+        # overdraft is allowed
         acct = self._account(token)
         value = parse_amount(amount)
         self._apply(acct, -value, WITHDRAWAL, CASH, CASH)
         return money(acct.balance)
 
     def transfer(self, token: str, target, amount) -> str:
-        """Send money to another account and return the sender's new balance."""
         sender = self._account(token)
         if target == token:
             raise BankError("Cannot transfer to yourself")
@@ -240,18 +221,16 @@ class Bank:
         return money(sender.balance)
 
     def history(self, token: str, from_ts=None, to_ts=None) -> List[dict]:
-        """History entries, oldest first, optionally limited to [from_ts, to_ts]."""
         acct = self._account(token)
         for bound in (from_ts, to_ts):
-            # bool is a subclass of int, so exclude it explicitly
             if bound is not None and (isinstance(bound, bool) or not isinstance(bound, (int, float))):
                 raise BankError("Invalid time range")
         return [e.to_wire() for e in acct.history
                 if (from_ts is None or e.ts >= from_ts) and (to_ts is None or e.ts <= to_ts)]
 
-    # ---------- standing orders ----------
+    # standing orders
+
     def so_create(self, token: str, target, amount, count) -> int:
-        """Create a monthly standing order, make its first payment now, return its id."""
         payer = self._account(token)
         if target == token:
             raise BankError("Cannot transfer to yourself")
@@ -266,11 +245,10 @@ class Bank:
         self.standing_orders[so.so_id] = so
         log.info("standing order #%d: %s -> %s, %s x %s", so.so_id, payer.token,
                  payee.token, money(value), count)
-        self._pay_standing_order(so)          # the first payment is made today
+        self._pay_standing_order(so)   # first payment is today
         return so.so_id
 
     def so_list(self, token: str) -> List[dict]:
-        """Active standing orders paid by this account."""
         self._account(token)
         return [{"so_id": so.so_id, "target": so.payee,
                  "target_name": self.accounts[so.payee].name, "amount": money(so.amount),
@@ -282,13 +260,11 @@ class Bank:
         self._account(token)
         so = self.standing_orders.get(so_id) if type(so_id) is int else None
         if so is None or so.payer != token:
-            # Someone else's order gets the same reply, so ids of other users' orders stay hidden.
             raise BankError("Unknown standing order")
         del self.standing_orders[so_id]
         log.info("standing order #%d cancelled", so_id)
 
     def _pay_standing_order(self, so: StandingOrder) -> None:
-        """Make one payment of ``so`` and schedule the next one (or finish the order)."""
         payer, payee = self.accounts[so.payer], self.accounts[so.payee]
         note = f"Standing order #{so.so_id}"
         self._apply(payer, -so.amount, CHARGE, payee.token, payee.name, note)
@@ -300,9 +276,9 @@ class Bank:
         else:
             so.next_run = next_month(so.next_run, so.day)
 
-    # ---------- loans ----------
+    # loans
+
     def loan(self, token: str, amount) -> Tuple[int, str]:
-        """Credit a loan now. Returns (loan_id, new balance)."""
         acct = self._account(token)
         value = parse_amount(amount)
         if self._in_debt(acct):
@@ -319,7 +295,6 @@ class Bank:
         return ln.loan_id, money(acct.balance)
 
     def loans_of(self, token: str) -> List[dict]:
-        """Unpaid loans of this account."""
         self._account(token)
         return [{"loan_id": ln.loan_id, "principal": money(ln.principal),
                  "repay": money(ln.repay), "taken_on": ln.taken_on.isoformat(),
@@ -327,27 +302,27 @@ class Bank:
                 for ln in self.loans.values() if ln.token == token]
 
     def _in_debt(self, acct: Account) -> bool:
-        """In debt = negative balance or an unpaid loan."""
         return acct.balance < 0 or any(ln.token == acct.token for ln in self.loans.values())
 
     def _repay_loan(self, ln: Loan) -> None:
-        """Take back principal + 5%, even if the balance goes negative."""
+        # taken even if it makes the balance negative
         acct = self.accounts[ln.token]
         self._apply(acct, -ln.repay, LOAN_REPAYMENT, BANK, BANK, f"Loan #{ln.loan_id}")
         del self.loans[ln.loan_id]
         log.info("loan #%d repaid", ln.loan_id)
-    # ---------- bank days ----------
+
+    # bank days
+
     def announce_date(self) -> None:
-        """Print the current bank date on the server console."""
         today = self.clock.today()
         print(f"Bank date: {today.isoformat()} ({today:%A})", flush=True)
 
     def on_console_line(self, line: str) -> None:
-        """Operator input. Enter = next day, a number N + Enter = advance N days."""
+        """Enter advances one day, a number N advances N days."""
         text = line.strip()
         if text == "":
             days = 1
-        elif text.isdecimal() and 1 <= int(text) <= MAX_DAYS_PER_COMMAND:   # not isdigit(): int("²") fails
+        elif text.isdecimal() and 1 <= int(text) <= MAX_DAYS_PER_COMMAND:
             days = int(text)
         else:
             print(f"Press Enter for the next day, or type a number of days (1-{MAX_DAYS_PER_COMMAND}).",
@@ -355,19 +330,15 @@ class Bank:
             return
         for _ in range(days):
             self.clock.advance_day()
-            self.run_due()            # each day is processed before the next one starts
+            self.run_due()
         self.announce_date()
 
     def run_due(self) -> None:
-        """Process every bank day that has started since the last call.
+        """Handle every day that started since the last call.
 
-        Called on every server loop iteration. The bank date changes when the
-        operator advances it, but also by itself at real midnight, since SimTime
-        keeps flowing with wall-clock time. For each new day, in this order:
-          1. overdraft interest for the day that ended,
-          2. move to the new day,
-          3. standing orders due on or before it,
-          4. loan repayments due on or before it.
+        The date can also change on its own at real midnight, so this runs on
+        every loop iteration. Per day: overdraft interest for the day that
+        ended, then standing orders, then loan repayments.
         """
         today = self.clock.today()
         while self._processed < today:
@@ -380,13 +351,12 @@ class Bank:
         for acct in self.accounts.values():
             if acct.balance < 0:
                 charge = (-acct.balance * OVERDRAFT_RATE).quantize(CENT, rounding=ROUND_HALF_UP)
-                if charge > 0:        # a balance above -10.00 gives less than half a cent
+                if charge > 0:   # rounds to 0 for small overdrafts
                     self._apply(acct, -charge, OVERDRAFT_INTEREST, BANK, BANK,
                                 "Daily overdraft interest (0.05%)")
 
     def _run_standing_orders(self, day: date) -> None:
-        # list(...) because paying may delete a finished order from the dict
-        for so in list(self.standing_orders.values()):
+        for so in list(self.standing_orders.values()):   # copy: finished orders get deleted
             while so.so_id in self.standing_orders and so.next_run <= day:
                 self._pay_standing_order(so)
 
