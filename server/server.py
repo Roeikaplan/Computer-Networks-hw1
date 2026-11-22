@@ -6,13 +6,94 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import select
+import socket
+import struct
 from datetime import date
+from typing import Any, Dict, List, Optional, Tuple
 
-from bank import Bank
+from bank import Bank, BankError
 from server_utils import Console
 
 log = logging.getLogger("server")
+
+# ----------------------------- constants ------------------------------
+HEADER = struct.Struct("!I")       # frame header: body length, uint32, network byte order
+MAX_REQUEST = 64 * 1024            # largest request body we accept (64 KiB)
+MAX_REPLY = 1024 * 1024            # largest reply body we send (1 MiB, the client's limit)
+MAX_PENDING = 1024 * 1024          # stop reading from a client while this much output waits
+RECV_SIZE = 4096                   # bytes per recv() call
+SELECT_TIMEOUT = 0.1               # seconds; select() returns at least this often
+BACKLOG = 16                       # connections waiting in the kernel to be accept()ed
+
+
+# ------------------------------ framing -------------------------------
+class FrameError(Exception):
+    """The byte stream broke the framing rules; the connection can't be trusted."""
+
+
+def pack_frame(body: bytes) -> bytes:
+    """Prefix a body with its 4-byte length."""
+    return HEADER.pack(len(body)) + body
+
+
+def extract_frames(buf: bytearray, max_size: int) -> List[bytes]:
+    """Remove every complete frame from the front of ``buf`` and return their bodies.
+
+    An incomplete frame at the end stays in ``buf`` until more bytes arrive.
+    Raises FrameError for a length of 0 or above ``max_size``. That is checked
+    as soon as the 4 header bytes are in, before waiting for the body.
+    """
+    frames = []
+    while len(buf) >= HEADER.size:
+        (length,) = HEADER.unpack_from(buf)
+        if length == 0 or length > max_size:
+            raise FrameError(f"bad frame length {length}")
+        end = HEADER.size + length
+        if len(buf) < end:
+            break                  # the body hasn't fully arrived yet
+        frames.append(bytes(buf[HEADER.size:end]))
+        del buf[:end]
+    return frames
+
+
+# ---------------------------- client state ----------------------------
+class ClientState:
+    """Everything the server keeps for one connected client."""
+
+    def __init__(self, sock: socket.socket, addr: Tuple[str, int]):
+        self.sock = sock
+        self.addr = f"{addr[0]}:{addr[1]}"
+        self.inbuf = bytearray()          # received bytes not yet turned into frames
+        self.outbuf = bytearray()         # reply bytes not yet sent
+        self.token: Optional[str] = None  # logged-in account on this connection, or None
+
+
+# --------------------------- request fields ---------------------------
+class FieldError(Exception):
+    """A request field is missing or has the wrong JSON type. ``str(self)`` is its name."""
+
+
+def str_field(req: dict, name: str) -> str:
+    value = req.get(name)
+    if not isinstance(value, str):
+        raise FieldError(name)
+    return value
+
+
+def int_field(req: dict, name: str) -> int:
+    value = req.get(name)
+    if type(value) is not int:          # not isinstance: True/False are ints too
+        raise FieldError(name)
+    return value
+
+
+def reject_constant(name: str):
+    """json.loads accepts NaN and Infinity, which aren't valid JSON. Refuse them."""
+    raise ValueError(f"invalid JSON constant {name}")
+
 
 ### Do not remove any of the existing functions or change their signatures. ###
 ### You can add new functions and classes if needed. ###
@@ -23,13 +104,227 @@ class Server:
 
         self.bank = bank
         self.bank.announce_date()
-        
+
         self.console = Console()
 
     def server_loop(self) -> None:
         """Main server loop for the bank server."""
-        # TODO implement this
-        pass
+        listener = self._open_listener()
+        if listener is None:
+            return
+        self.clients: Dict[socket.socket, ClientState] = {}
+        try:
+            while True:
+                # Only sockets with replies waiting go into wlist. A socket is almost
+                # always writable, so listing every client would make select() return at once.
+                wlist = [s for s, c in self.clients.items() if c.outbuf]
+                # Back-pressure: a client that sends requests but doesn't read its replies
+                # isn't read from until it catches up, so its outbuf can't grow without limit.
+                rlist = [listener] + [s for s, c in self.clients.items()
+                                      if len(c.outbuf) < MAX_PENDING]
+                readable, writable, _ = select.select(rlist, wlist, [], SELECT_TIMEOUT)
+                for sock in readable:
+                    if sock is listener:
+                        self._accept(listener)
+                    elif sock in self.clients:      # it may have been closed earlier in this round
+                        self._read(self.clients[sock])
+                for sock in writable:
+                    if sock in self.clients:
+                        self._write(self.clients[sock])
+
+                self.console.poll(self.bank.on_console_line)   # Enter = next bank day
+                self.bank.run_due()                            # also catches real midnight
+        finally:
+            for client in list(self.clients.values()):
+                self._close(client, "server shutting down")
+            listener.close()
+
+    # ---------- connections ----------
+    def _open_listener(self) -> Optional[socket.socket]:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR there would let another program bind the same port.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # Unix: allow a restart while old connections are still in TIME_WAIT.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind((self.host, self.port))
+        except OSError as err:
+            listener.close()
+            print(f"Cannot listen on port {self.port}: {err}", flush=True)
+            return None
+        listener.listen(BACKLOG)
+        listener.setblocking(False)
+        print(f"Listening on {self.host or '0.0.0.0'}:{self.port}. "
+              "Press Enter for the next bank day, Ctrl+C to stop.", flush=True)
+        return listener
+
+    def _accept(self, listener: socket.socket) -> None:
+        try:
+            sock, addr = listener.accept()
+        except OSError as err:          # the client gave up before we got to it
+            log.info("accept failed: %s", err)
+            return
+        sock.setblocking(False)
+        client = ClientState(sock, addr)
+        self.clients[sock] = client
+        log.info("%s connected (%d online)", client.addr, len(self.clients))
+
+    def _close(self, client: ClientState, reason: str) -> None:
+        """Forget the client and close its socket. Its login ends with it."""
+        if self.clients.pop(client.sock, None) is None:
+            return                      # already closed
+        try:
+            client.sock.close()
+        except OSError:
+            pass
+        log.info("%s disconnected: %s (%d online)", client.addr, reason, len(self.clients))
+
+    # ---------- receiving ----------
+    def _read(self, client: ClientState) -> None:
+        try:
+            data = client.sock.recv(RECV_SIZE)
+        except BlockingIOError:         # nothing to read after all
+            return
+        except OSError as err:          # e.g. ConnectionResetError: the client crashed
+            self._close(client, f"error: {err}")
+            return
+        if not data:                    # b"": the client closed its side (FIN)
+            self._close(client, "closed by client")
+            return
+        client.inbuf += data
+        try:
+            frames = extract_frames(client.inbuf, MAX_REQUEST)
+        except FrameError as err:
+            log.warning("%s: %s, closing", client.addr, err)
+            self._close(client, str(err))
+            return
+        for body in frames:
+            self._handle_frame(client, body)
+
+    # ---------- sending ----------
+    def _write(self, client: ClientState) -> None:
+        """Send as much of the pending output as the socket takes right now."""
+        try:
+            sent = client.sock.send(client.outbuf)
+        except BlockingIOError:         # the send buffer is full after all
+            return
+        except OSError as err:          # the client went away
+            self._close(client, f"error: {err}")
+            return
+        # send() may take only part of the buffer. Keep the rest for the next round.
+        del client.outbuf[:sent]
+
+    # ---------- requests ----------
+    def _handle_frame(self, client: ClientState, body: bytes) -> None:
+        """One complete request frame in, exactly one reply frame queued."""
+        reply = self._process(client, body)
+        log.info("%s <- %s", client.addr, reply)
+        data = json.dumps(reply, separators=(",", ":")).encode("utf-8")
+        if len(data) > MAX_REPLY:       # e.g. a huge history; the client would reject the frame
+            log.warning("%s: reply of %d bytes is too large", client.addr, len(data))
+            data = b'{"ok":false,"error":"Reply too large"}'
+        client.outbuf += pack_frame(data)
+
+    def _process(self, client: ClientState, body: bytes) -> Dict[str, Any]:
+        """Turn a request body into a reply dict. Never raises."""
+        try:
+            req = json.loads(body.decode("utf-8"), parse_constant=reject_constant)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # RecursionError: 64 KiB of "[[[[..." nests deeper than the parser allows
+            return {"ok": False, "error": "Malformed request"}
+        if not isinstance(req, dict):
+            return {"ok": False, "error": "Malformed request"}
+        log.info("%s -> %s", client.addr, {k: ("***" if k == "password" else v) for k, v in req.items()})
+
+        op = req.get("op")
+        entry = self.OPS.get(op) if isinstance(op, str) else None
+        if entry is None:
+            return {"ok": False, "error": "Unknown operation"}
+        handler_name, needs_login = entry
+        if needs_login and client.token is None:
+            return {"ok": False, "error": "Not logged in"}
+        try:
+            return {"ok": True, **getattr(self, handler_name)(client, req)}
+        except BankError as err:
+            return {"ok": False, "error": str(err)}
+        except FieldError as err:
+            return {"ok": False, "error": f"Missing or invalid field: {err}"}
+        except Exception:
+            # A bug in our code. Log it, answer, and keep serving everyone else.
+            log.exception("%s: internal error on %r", client.addr, op)
+            return {"ok": False, "error": "Internal server error"}
+
+    # op -> (handler method, needs login)
+    OPS = {
+        "register":  ("_op_register", False),
+        "login":     ("_op_login", False),
+        "logout":    ("_op_logout", True),
+        "balance":   ("_op_balance", True),
+        "deposit":   ("_op_deposit", True),
+        "withdraw":  ("_op_withdraw", True),
+        "transfer":  ("_op_transfer", True),
+        "so_create": ("_op_so_create", True),
+        "so_list":   ("_op_so_list", True),
+        "so_cancel": ("_op_so_cancel", True),
+        "loan":      ("_op_loan", True),
+        "loans":     ("_op_loans", True),
+        "history":   ("_op_history", True),
+    }
+
+    # ---------- one handler per op: read fields, call the Bank, return reply fields ----------
+    def _op_register(self, client: ClientState, req: dict) -> dict:
+        return {"token": self.bank.register(str_field(req, "name"), str_field(req, "password"))}
+
+    def _op_login(self, client: ClientState, req: dict) -> dict:
+        if client.token is not None:
+            raise BankError("Already logged in")
+        token = str_field(req, "token")
+        name = self.bank.login(token, str_field(req, "password"))
+        client.token = token                 # the session: this connection is now this account
+        log.info("%s logged in as %s", client.addr, token)
+        return {"name": name}
+
+    def _op_logout(self, client: ClientState, req: dict) -> dict:
+        log.info("%s logged out of %s", client.addr, client.token)
+        client.token = None                  # the client closes the connection next
+        return {}
+
+    def _op_balance(self, client: ClientState, req: dict) -> dict:
+        return {"balance": self.bank.balance(client.token)}
+
+    def _op_deposit(self, client: ClientState, req: dict) -> dict:
+        return {"balance": self.bank.deposit(client.token, str_field(req, "amount"))}
+
+    def _op_withdraw(self, client: ClientState, req: dict) -> dict:
+        return {"balance": self.bank.withdraw(client.token, str_field(req, "amount"))}
+
+    def _op_transfer(self, client: ClientState, req: dict) -> dict:
+        return {"balance": self.bank.transfer(client.token, str_field(req, "target"),
+                                              str_field(req, "amount"))}
+
+    def _op_so_create(self, client: ClientState, req: dict) -> dict:
+        return {"so_id": self.bank.so_create(client.token, str_field(req, "target"),
+                                             str_field(req, "amount"), str_field(req, "count"))}
+
+    def _op_so_list(self, client: ClientState, req: dict) -> dict:
+        return {"orders": self.bank.so_list(client.token)}
+
+    def _op_so_cancel(self, client: ClientState, req: dict) -> dict:
+        self.bank.so_cancel(client.token, int_field(req, "so_id"))
+        return {}
+
+    def _op_loan(self, client: ClientState, req: dict) -> dict:
+        loan_id, balance = self.bank.loan(client.token, str_field(req, "amount"))
+        return {"loan_id": loan_id, "balance": balance}
+
+    def _op_loans(self, client: ClientState, req: dict) -> dict:
+        return {"loans": self.bank.loans_of(client.token)}
+
+    def _op_history(self, client: ClientState, req: dict) -> dict:
+        # Both bounds are optional; the Bank checks that they are numbers or null.
+        return {"entries": self.bank.history(client.token, req.get("from_ts"), req.get("to_ts"))}
 
 
 

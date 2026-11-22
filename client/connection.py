@@ -7,8 +7,19 @@ with a user-facing message. Transport failures raise ``ConnectionError`` / ``OSE
 """
 from __future__ import annotations
 
+import json
+import socket
+import struct
 from enum import Enum
 from typing import Callable, List, Optional, Tuple, Union
+
+# ------------------------------ Protocol constants (see PROTOCOL.md) ------------------------------
+HEADER = struct.Struct("!I")      # 4-byte big-endian length before every JSON body
+MAX_REQUEST = 64 * 1024           # the server closes the connection on a bigger request
+MAX_REPLY = 1024 * 1024           # we refuse a bigger reply (the server never sends one)
+RECV_SIZE = 64 * 1024             # most bytes asked from one recv() call
+CONNECT_TIMEOUT = 5.0             # seconds to wait for the TCP handshake
+REPLY_TIMEOUT = 10.0              # seconds to wait for a reply before giving up
 
 
 class TxType(Enum):
@@ -36,6 +47,30 @@ class ProtocolError(Exception):
 class RequestFailed(Exception):
     """The server rejected the request. ``str(self)`` is safe to show to the user."""
 
+
+# ------------------------------ reply checking ------------------------------
+def _field(obj: dict, key: str, kind: type, optional: bool = False):
+    """Return ``obj[key]`` if it has the expected JSON type, else raise ``ProtocolError``.
+
+    ``kind`` is ``str`` or ``int``. The check is ``type(x) is kind``, so JSON
+    ``true``/``false`` (bools are ints in Python) do not pass as numbers.
+    ``optional=True`` also accepts ``null`` and returns ``None``.
+    """
+    value = obj.get(key)
+    if value is None and optional:
+        return None
+    if type(value) is not kind:
+        raise ProtocolError(f"Reply field '{key}' is missing or has the wrong type")
+    return value
+
+
+def _items(reply: dict, key: str) -> List[dict]:
+    """Return ``reply[key]`` if it is a list of JSON objects, else raise ``ProtocolError``."""
+    items = reply.get(key)
+    if type(items) is not list or not all(type(item) is dict for item in items):
+        raise ProtocolError(f"Reply field '{key}' is not a list of objects")
+    return items
+
 ### Do not remove any of the existing functions or change their signatures. ###
 ### You can add new functions and classes if needed. ###
 class Connection:
@@ -45,14 +80,12 @@ class Connection:
     """
 
     def __init__(self):
-        # TODO implement this
-        pass
+        self._sock: Optional[socket.socket] = None   # None while not connected
 
     @property
     def connected(self) -> bool:
         """Returns True if a TCP connection to the server is currently open."""
-        # TODO implement this
-        pass
+        return self._sock is not None
 
     def connect(self, host: str, port: int) -> None:
         """Open a TCP connection to the bank server.
@@ -68,8 +101,14 @@ class Connection:
         Raises:
             OSError / ConnectionError: if the server cannot be reached.
         """
-        # TODO implement this
-        pass
+        self.close()                                   # never leak an older socket
+        try:
+            sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+        except socket.timeout as err:
+            raise ConnectionError(
+                f"No answer from {host}:{port} within {CONNECT_TIMEOUT:g} seconds") from err
+        sock.settimeout(REPLY_TIMEOUT)                 # from now on: the limit for each recv/send
+        self._sock = sock
 
     def close(self) -> None:
         """Close the TCP connection if one is open. Safe to call more than once.
@@ -77,8 +116,81 @@ class Connection:
         Returns:
             None.
         """
-        # TODO implement this
-        pass
+        sock, self._sock = self._sock, None            # mark closed first, even if close() fails
+        if sock is not None:
+            try:
+                sock.close()                           # sends FIN; the server drops our session
+            except OSError:
+                pass
+
+    # ------------------------------ transport helpers ------------------------------
+    def _request(self, op: str, **fields) -> dict:
+        """Send one request and return the server's reply when ``ok`` is true.
+
+        Raises:
+            RequestFailed: the server answered ``{"ok": false, "error": ...}``.
+            ProtocolError: the reply could not be understood.
+            ConnectionError / OSError: not connected, connection lost, or no reply in time.
+        """
+        if self._sock is None:
+            raise ConnectionError("Not connected to the server")
+        body = json.dumps({"op": op, **fields}, separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_REQUEST:                    # nothing sent yet, so the stream is fine
+            raise RequestFailed("Request too large")
+        try:
+            self._send_all(HEADER.pack(len(body)) + body)       # header + body in one write
+            reply = self._recv_reply()
+        except socket.timeout as err:
+            # A late reply would be read as the answer to our NEXT request: drop the connection.
+            self.close()
+            raise ConnectionError(f"No reply from the server within {REPLY_TIMEOUT:g} seconds") from err
+        except BaseException:
+            # Lost connection, bad reply, even Ctrl+C mid-read: the stream is out of sync.
+            self.close()
+            raise
+
+        ok = reply.get("ok")
+        if ok is True:
+            return reply
+        if ok is False:
+            error = reply.get("error")
+            if not isinstance(error, str):
+                raise ProtocolError("Error reply without a message")
+            raise RequestFailed(error)
+        raise ProtocolError("Reply has no valid 'ok' field")
+
+    def _send_all(self, data: bytes) -> None:
+        """Send every byte of ``data``: ``send()`` may take only part of it."""
+        view = memoryview(data)                        # slicing a memoryview copies nothing
+        while view:
+            sent = self._sock.send(view)               # blocks at most REPLY_TIMEOUT seconds
+            if sent == 0:
+                raise ConnectionError("The connection was closed while sending")
+            view = view[sent:]                         # keep only what is still unsent
+
+    def _recv_reply(self) -> dict:
+        """Read one whole frame and decode its JSON object."""
+        (length,) = HEADER.unpack(self._recv_exact(HEADER.size))
+        if not 1 <= length <= MAX_REPLY:
+            raise ProtocolError(f"Bad reply length: {length}")
+        body = self._recv_exact(length)
+        try:
+            reply = json.loads(body.decode("utf-8"))
+        except (ValueError, RecursionError) as err:   # bad UTF-8 / bad JSON / absurd nesting
+            raise ProtocolError("Reply is not valid JSON") from err
+        if not isinstance(reply, dict):
+            raise ProtocolError("Reply is not a JSON object")
+        return reply
+
+    def _recv_exact(self, n: int) -> bytes:
+        """Receive exactly ``n`` bytes. TCP may deliver them in any number of pieces."""
+        data = bytearray()
+        while len(data) < n:
+            chunk = self._sock.recv(min(n - len(data), RECV_SIZE))
+            if not chunk:                              # b"" = the server closed the connection
+                raise ConnectionError("The server closed the connection")
+            data += chunk
+        return bytes(data)
 
     def req_register(self, user: str, password: str) -> str:
         """Register a new account.
@@ -94,8 +206,8 @@ class Connection:
             RequestFailed: registration rejected (bad username/password, …).
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return "EXAMPLE_ID"
+        reply = self._request("register", name=user, password=password)
+        return _field(reply, "token", str)
 
     def req_login(self, token: str, password: str) -> str:
         """Log in to an existing account on this connection.
@@ -111,8 +223,8 @@ class Connection:
             RequestFailed: wrong credentials / unknown user id.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return "EXAMPLE_NAME"
+        reply = self._request("login", token=token, password=password)
+        return _field(reply, "name", str)
 
     def req_logout(self) -> None:
         """Log out and close the connection.
@@ -120,8 +232,14 @@ class Connection:
         Returns:
             None.
         """
-        # TODO implement this
-        pass
+        if not self.connected:
+            return                                     # nothing to log out of
+        try:
+            self._request("logout")
+        except RequestFailed:
+            pass                                       # e.g. "Not logged in": already logged out
+        finally:
+            self.close()                               # always, even if the request failed
 
     def req_get_balance(self) -> str:
         """Fetch the logged-in account's balance.
@@ -133,8 +251,7 @@ class Connection:
             RequestFailed: not logged in or server error.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return "0.00"
+        return _field(self._request("balance"), "balance", str)
 
     def req_deposit(self, amount: str) -> str:
         """Deposit cash into the logged-in account.
@@ -149,8 +266,7 @@ class Connection:
             RequestFailed: invalid amount or not logged in.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return "0.00"
+        return _field(self._request("deposit", amount=amount), "balance", str)
 
     def req_withdraw(self, amount: str) -> str:
         """Withdraw cash from the logged-in account (may go negative).
@@ -165,8 +281,7 @@ class Connection:
             RequestFailed: invalid amount or not logged in.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return "0.00"
+        return _field(self._request("withdraw", amount=amount), "balance", str)
 
     def req_transfer(self, target: str, amount: str) -> str:
         """Transfer money to another account.
@@ -182,8 +297,8 @@ class Connection:
             RequestFailed: bad amount, unknown target, self-transfer, …
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return "0.00"
+        reply = self._request("transfer", target=target, amount=amount)
+        return _field(reply, "balance", str)
 
     def req_schedule_so(self, target: str, amount: str, count: str) -> int:
         """Create a monthly standing order (first payment today).
@@ -200,8 +315,8 @@ class Connection:
             RequestFailed: validation error or unknown target.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return 1
+        reply = self._request("so_create", target=target, amount=amount, count=count)
+        return _field(reply, "so_id", int)
 
     def req_get_so_list(self) -> List[Tuple[int, str, str, str, int, Optional[int], str]]:
         """List active standing orders paid by the logged-in account.
@@ -224,9 +339,15 @@ class Connection:
             RequestFailed: not logged in or server error.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return [(1, "EXAMPLE_ID1", "EXAMPLE_NAME1", "0.00", 1, 2, "2026-11-12"),
-                (2, "EXAMPLE_ID2", "EXAMPLE_NAME2", "0.00", 4, None, "2026-11-20")]
+        orders = _items(self._request("so_list"), "orders")
+        return [(_field(o, "so_id", int),
+                 _field(o, "target", str),
+                 _field(o, "target_name", str),
+                 _field(o, "amount", str),
+                 _field(o, "executed", int),
+                 _field(o, "remaining", int, optional=True),   # null = until cancelled
+                 _field(o, "next_run", str))
+                for o in orders]
 
     def req_cancel_so(self, so_id: Union[str, int]) -> None:
         """Cancel one of the logged-in account's standing orders.
@@ -241,8 +362,12 @@ class Connection:
             RequestFailed: unknown standing order or not owned by this account.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        pass
+        # The GUI passes the id as text from its table; the protocol wants a JSON int.
+        if type(so_id) is str and so_id.isascii() and so_id.isdigit():
+            so_id = int(so_id)
+        if type(so_id) is not int:
+            raise RequestFailed("Invalid standing order id")
+        self._request("so_cancel", so_id=so_id)
 
     def req_loan(self, amount: str) -> Tuple[int, str]:
         """Take a loan (principal credited now; auto-repay after 30 bank days + 5%).
@@ -258,8 +383,8 @@ class Connection:
             RequestFailed: invalid amount or not logged in.
             ConnectionError: connection lost.
         """
-        # TODO implement this
-        return (1, "0.00")
+        reply = self._request("loan", amount=amount)
+        return (_field(reply, "loan_id", int), _field(reply, "balance", str))
 
     def req_get_loans(self) -> List[Tuple[int, str, str, str, str]]:
         """List unpaid loans for the logged-in account.
@@ -279,8 +404,13 @@ class Connection:
             RequestFailed: not logged in or server error.
             ConnectionError: connection lost.
         """
-        return [(1, "100.00", "105.00", "2026-11-12", "2026-11-12"),
-                (2, "200.00", "210.00", "2026-11-20", "2026-11-20")]
+        loans = _items(self._request("loans"), "loans")
+        return [(_field(ln, "loan_id", int),
+                 _field(ln, "principal", str),
+                 _field(ln, "repay", str),
+                 _field(ln, "taken_on", str),
+                 _field(ln, "due_on", str))
+                for ln in loans]
 
     def req_history(self, from_ts: Optional[float] = None,
                     to_ts: Optional[float] = None) -> List[Tuple[str, TxType, str, str, str, str, str]]:
@@ -308,5 +438,19 @@ class Connection:
             RequestFailed: not logged in or bad timestamps.
             ConnectionError: connection lost.
         """
-        return [("2026-11-12 14:15:20", TxType.TRANSFER_OUT, "EXAMPLE_ID2", "EXAMPLE_NAME2", "100.00", "100.00", ""),
-                ("2026-11-12 14:13:20", TxType.DEPOSIT, "EXAMPLE_ID1", "EXAMPLE_NAME1", "200.00", "200.00", "")]
+        reply = self._request("history", from_ts=from_ts, to_ts=to_ts)   # None -> null = no bound
+        history = []
+        for e in _items(reply, "entries"):
+            raw_type = _field(e, "type", str)
+            try:
+                tx_type = TxType(raw_type)                 # "DEPOSIT" -> TxType.DEPOSIT
+            except ValueError as err:
+                raise ProtocolError(f"Unknown history entry type: {raw_type!r}") from err
+            history.append((_field(e, "time", str),
+                            tx_type,
+                            _field(e, "party", str),
+                            _field(e, "party_name", str),
+                            _field(e, "amount", str),
+                            _field(e, "balance", str),
+                            _field(e, "note", str)))
+        return history                                     # oldest first, as the server sends it
