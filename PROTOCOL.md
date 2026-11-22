@@ -24,7 +24,7 @@ Example: `00 00 00 21` + `{"op":"deposit","amount":"99.90"}` (33 bytes).
 
 ## Design choices
 
-- **TCP:** a bank can't lose or reorder operations.
+- **TCP:** a bank can't lose or reorder operations. With UDP we would have to build resending and ordering ourselves.
 - **Length-prefixed frames:** TCP is a byte stream, so messages need boundaries. Fixed-size messages waste space, and a delimiter needs escaping and a scan of every byte. A length field tells the receiver exactly how much to read.
 - **Big-endian length (`!I`):** network byte order, so both sides agree regardless of the CPU.
 - **JSON body:** easy to read in Wireshark and built into Python. Our messages are small, so a binary body wouldn't save much.
@@ -83,7 +83,7 @@ history  -> {"time":"2026-11-20 14:15:02","type":"TRANSFER_OUT","party":"ZX81QWE
 The rules:
 
 - `register` does not log you in. Names don't have to be unique.
-- Standing orders pay monthly, and the first payment is made right away.
+- Standing orders pay monthly, and the first payment is made right away. In a shorter month (e.g. the 31st in February) the payment is made on the month's last day.
 - A loan is refused while you have a negative balance or an unpaid loan.
 - History is oldest first and the time bounds are inclusive. `amount` is signed. `party` is a token, `CASH` (deposits and withdrawals) or `BANK` (loans, repayments, interest).
 - History types: `DEPOSIT`, `WITHDRAWAL`, `TRANSFER_IN`, `TRANSFER_OUT`, `CHARGE` (standing order payment), `LOAN`, `LOAN_REPAYMENT`, `OVERDRAFT_INTEREST`.
